@@ -1,115 +1,120 @@
-/*
-event_loop.c
-Responsible for:
-- monitoring sockets
-- dispatching events
-- coordinating everything
-*/
-
 #include "event_loop.h"
+#include "peer.h"
+#include "net.h"
+#include "backend.h"    // <-- use backend handlers, no more handle_* functions
+#include <stdio.h>
+#include <sys/select.h>
+#include <unistd.h>
+#include <string.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
-void run_event_loop(int listener_fd, peer_list *peers) {
-    while(1) {
-        // set of fds we want to monitor
-        // a "bitmask", e.g.
-        // fd : 0 1 2 3 4 5 6
-        // bit: 1 0 0 1 0 0 0
-        // 1 means watch this fd
-        fd_set read_fds;
+static peer_list* g_peers = NULL;
+static int g_listener_fd = -1;
 
-        // clear the bitmask (all zeros)
+static void make_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+// --------------------
+// Blocking run
+// --------------------
+void run_event_loop(int listener_fd, peer_list* peers, const char* nickname) {
+    (void)nickname; // unused
+
+    g_peers = peers;
+    g_listener_fd = listener_fd;
+
+    fd_set read_fds;
+    char buffer[512];
+
+    while (1) {
         FD_ZERO(&read_fds);
-
-        int max_fd = 0;
-        /*Add fds to the watch list*/
-
-        // watch listener socket
         FD_SET(listener_fd, &read_fds);
-        if (listener_fd > max_fd) { 
-            max_fd = listener_fd;
-        }
-
-        // watch stdin (fd = 0)
         FD_SET(STDIN_FILENO, &read_fds);
-        if (STDIN_FILENO > max_fd) { 
-            max_fd = STDIN_FILENO;
-        }
 
-        // watch all peers
-        for (int i = 0; i < peers->count; i++) {
+        int max_fd = listener_fd > STDIN_FILENO ? listener_fd : STDIN_FILENO;
+
+        for (size_t i = 0; i < peers->count; i++) {
             int fd = peers->fds[i];
             FD_SET(fd, &read_fds);
-
-            if (fd > max_fd) {
-                max_fd = fd;
-            }
+            if (fd > max_fd) max_fd = fd;
         }
 
-        // copies fd_set (bitmask) read_fds into kernell spaces
-        // checks all listed descriptors
-        // - max_fd + 1 means check fds from 0 to max
-        // if none are ready, go back to sleep, no CPU usage
-        // if one is ready, network packet arrives, user types input, kernel wakes up
-        // - read_fds is updated
         int ready = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+        if (ready < 0) { perror("select"); continue; }
 
-        // none are ready
-        if (ready < 0) {
-            perror("select");
-            return;
-        }
-
-        // listener ready (bitmask is 1) -> new peer
+        // Accept new peers
         if (FD_ISSET(listener_fd, &read_fds)) {
-            int peer = accept_peer(listener_fd);
-            if (peer >= 0) {
-                printf("Peer accepted %d\n", peer);
-                peer_add(peers,peer);
-            }
+            int fd = accept_peer(listener_fd);
+            if (fd >= 0) backend_notify_peer_connected(fd);
         }
 
-        // stdin ready -> user input
+        // Handle user input from stdin
         if (FD_ISSET(STDIN_FILENO, &read_fds)) {
-            char buffer[256];
-
             if (fgets(buffer, sizeof(buffer), stdin)) {
-                printf("You typed: %s", buffer);
+                buffer[strcspn(buffer, "\n")] = '\0';
+                backend_send_message(buffer);
             }
         }
 
-        for (int i = 0; i < peers->count; i++) {
-            // get the socket descriptor
+        // Handle peer messages
+        for (size_t i = 0; i < peers->count; i++) {
             int fd = peers->fds[i];
-    
-            // check if socket is marked ready
-            // ready means:
-            // - data arrived
-            // - peer disconnected
-            // - error occured
             if (FD_ISSET(fd, &read_fds)) {
-                char buffer[256];
-    
-                // give available data
-                // detect the case of what we're dealing with here
-                int n = recv(fd, buffer, sizeof(buffer) - 1, 0);
-    
-                // data received
+                int n = recv(fd, buffer, sizeof(buffer)-1, 0);
                 if (n > 0) {
                     buffer[n] = '\0';
-                    printf("Peer %d says: %s", fd, buffer);
-                    peer_broadcast_except(peers, fd, buffer, n);
-                // disconnect
-                } else if (n == 0) {
-                    printf("Peer %d disconnected\n", fd);
-                    peer_remove(peers, i);
-                    i--;
-                // error - something went wrong
+                    backend_notify_peer_message(fd, buffer, n);
                 } else {
-                    perror("recv");
-                    printf("Error: something went wrong.");
-                    peer_remove(peers, i);
-                    i--;
+                    backend_notify_peer_disconnected(fd);
                 }
+            }
+        }
+    }
+}
+
+// --------------------
+// Non-blocking poll
+// --------------------
+void poll_event_loop(void) {
+    if (!g_peers || g_listener_fd < 0) return;
+
+    fd_set read_fds;
+    char buffer[512];
+
+    FD_ZERO(&read_fds);
+    FD_SET(g_listener_fd, &read_fds);
+    int max_fd = g_listener_fd;
+
+    for (size_t i = 0; i < g_peers->count; i++) {
+        int fd = g_peers->fds[i];
+        FD_SET(fd, &read_fds);
+        if (fd > max_fd) max_fd = fd;
+    }
+
+    struct timeval tv = {0, 0}; // non-blocking select
+    int ready = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+    if (ready < 0) { perror("select"); return; }
+
+    // Accept new peers
+    if (FD_ISSET(g_listener_fd, &read_fds)) {
+        int fd = accept_peer(g_listener_fd);
+        if (fd >= 0) backend_notify_peer_connected(fd);
+    }
+
+    // Handle peer messages
+    for (size_t i = 0; i < g_peers->count; i++) {
+        int fd = g_peers->fds[i];
+        if (FD_ISSET(fd, &read_fds)) {
+            int n = recv(fd, buffer, sizeof(buffer)-1, 0);
+            if (n > 0) {
+                buffer[n] = '\0';
+                backend_notify_peer_message(fd, buffer, n);
+            } else {
+                backend_notify_peer_disconnected(fd);
             }
         }
     }

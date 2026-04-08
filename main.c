@@ -1,29 +1,39 @@
-/*
-main.c
-This is the main program.
-*/
-
+#include "backend.h"
 #include <stdio.h>
-#include "net.h"
-#include "event_loop.h"
-#include "peer.h"
+#include <string.h>
 
-int main() {
-    printf("Hello, World!\n");
+/* Defined in UI/main_ui.c */
+void run_ui(void);
+void ui_on_msg(int fd, const char* msg);
+void ui_on_peer_connected(int fd);
+void ui_on_peer_disconnected(int fd);
 
-    // 1. Create listener socket
-    int listener = create_listener(5000);
-    if (listener < 0) {
-        fprintf(stderr, "Failed to create listener\n");
-        return 1;
+int main(void)
+{
+    char nickname[32] = {0};
+    int  my_port      = 0;
+
+    printf("Enter nickname: ");
+    if (!fgets(nickname, sizeof(nickname), stdin)) return 1;
+    nickname[strcspn(nickname, "\n")] = '\0';
+    if (nickname[0] == '\0') { fprintf(stderr, "Nickname cannot be empty\n"); return 1; }
+
+    printf("Enter listen port (0 to skip): ");
+    if (scanf("%d", &my_port) != 1) return 1;
+    getchar(); /* consume newline */
+
+    backend_init(nickname,
+                 ui_on_msg,
+                 ui_on_peer_connected,
+                 ui_on_peer_disconnected);
+
+    if (my_port > 0) {
+        if (backend_start_listening(my_port) < 0) {
+            fprintf(stderr, "Failed to listen on port %d\n", my_port);
+            return 1;
+        }
     }
 
-    // 2. Create and initialize peer manager
-    peer_list peers;
-    peer_list_init(&peers);
-
-    // 3. Run event loop
-    run_event_loop(listener, &peers);
-
+    run_ui();       /* blocks until window closed; calls backend_shutdown() */
     return 0;
 }

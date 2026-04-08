@@ -1,43 +1,39 @@
-# Compiler and flags
-CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -g
-LDFLAGS =
+# -----------------------------------------------------------------------
+# TorChat – P2P chat with Raylib/raygui frontend
+# Requires: raylib installed system-wide (e.g. brew install raylib / apt install libraylib-dev)
+# -----------------------------------------------------------------------
 
-# Project name
-TARGET = torchat
+CC      = gcc
+TARGET  = torchat
 
-# Directories
-SRC_DIR = .
-OBJ_DIR = obj
+SRCS    = main.c \
+          backend.c \
+          net.c \
+          UI/main_ui.c
 
-# Source and object files
-SRCS = $(wildcard $(SRC_DIR)/*.c)
-OBJS = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
+CFLAGS  = -Wall -Wextra -std=c11 -O2 \
+          -I. -IUI
 
-# Default target
+# Adjust LDFLAGS for your platform:
+#   macOS:  -framework OpenGL -framework Cocoa -framework IOKit -framework CoreAudio -framework CoreVideo
+#   Linux:  -lGL -lm -lpthread -ldl -lrt -lX11
+
+UNAME := $(shell uname)
+
+ifeq ($(UNAME), Darwin)
+    LDFLAGS = -lraylib \
+              -framework OpenGL -framework Cocoa \
+              -framework IOKit -framework CoreAudio -framework CoreVideo
+else
+    LDFLAGS = -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
+endif
+
+.PHONY: all clean
+
 all: $(TARGET)
 
-# Link step
-$(TARGET): $(OBJS)
+$(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-# Compile step
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Create object directory if it doesn't exist
-$(OBJ_DIR):
-	mkdir -p $(OBJ_DIR)
-
-# Run the program
-run: $(TARGET)
-	./$(TARGET)
-
-# Clean build files
 clean:
-	rm -rf $(OBJ_DIR) $(TARGET)
-
-# Rebuild from scratch
-rebuild: clean all
-
-.PHONY: all run clean rebuild
+	rm -f $(TARGET)

@@ -1,7 +1,5 @@
-#ifndef NET_H
-#define NET_H
+#pragma once
 
 int create_listener(int port);
 int accept_peer(int listener_fd);
-
-#endif
+int connect_to_peer(const char* ip, int port);
