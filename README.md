@@ -1,55 +1,160 @@
-# Tutorial for Cooperation
+# TorChat
 
-## 🎨 Frontend & UI Development Guide (C99)
+A peer-to-peer chat application written in C with a graphical interface. TorChat lets users chat directly with each other over a local network or the internet — no central server required. Peers connect by exchanging IP addresses and port numbers, and all messages flow directly between clients.
 
-This directory contains the standalone **UI Sandbox** for the TorChat project. To maintain modularity and avoid breaking the backend networking logic, the UI is currently developed in this isolated environment using **Raylib** and **Raygui**, strictly following the **C99** standard.
-
-### 1. How to Build & Run (UI Sandbox)
-To preview the current UI prototype without affecting the backend build, follow these steps:
-
-1. **Navigate to the UI directory:**
-   ```bash
-   cd UI
-   ```
-2. **Compile using GCC (MinGW/Windows):**
-   ```bash
-   gcc main_ui.c -o chat_ui.exe -O1 -Wall -std=c99 -I include/ -L lib/ -lraylib -lopengl32 -lgdi32 -lwinmm
-   ```
-3. **Run the executable:**
-   ```bash
-   ./chat_ui.exe
-   ```
-
-### 2. UI Layout Components
-The current `main_ui.c` implements a **Single-process non-blocking loop**:
-* **Sidebar (Peer List):** Displays active nodes in the P2P network.
-* **Central Panel (Chat History):** Reserved for rendering the message stream.
-* **Bottom Bar (Input Area):** Features a functional text box and a "SEND" button for user interaction.
+> **Course project** — CPTS 360, Spring 2026
 
 ---
 
-## 🔗 Integration Points (Action Items for Discussion)
+## Features
 
-To successfully merge the Frontend with the Backend (`net.c`, `peer.c`, `event_loop.c`), we need to align on the following technical interfaces during our next meeting:
-
-### A. Shared Data Structures
-The UI needs to read data from the backend. We should define a thread-safe (or globally accessible) way to access:
-* **`active_peers` List:** A structure containing the display names and IP addresses of connected peers so the UI can update the sidebar.
-* **`message_buffer`:** A ring buffer or linked list where `net.c` stores incoming messages. The UI will poll this buffer every frame to update the chat history.
-
-### B. Event Loop Unification
-Since the project is restricted to a **single-process**, we cannot run the UI and the Network on separate threads. 
-* **Proposal:** We must modify the `poll()` timeout in `event_loop.c` to `0` (non-blocking). 
-* **Goal:** The main loop should look like: `Run UI Frame` -> `Poll Network Events` -> `Update UI State` -> `Repeat`.
-
-### C. Action Callbacks
-We need to finalize the function signatures for the following UI-triggered actions:
-* `void ui_send_message(const char* text);` // Triggered when the "SEND" button is clicked.
-* `void ui_connect_to_peer(const char* ip);` // Triggered when adding a new peer manually.
+- **Serverless P2P messaging** — peers connect directly via TCP; no relay or sign-in server needed
+- **Graphical UI** — 900×620 window built with [Raylib](https://www.raylib.com/) and [raygui](https://github.com/raysan5/raygui), running at 60 FPS
+- **Multi-peer support** — up to 64 simultaneous peer connections
+- **Nickname handshake** — peers automatically exchange display names on connect via a lightweight `/nick` / `/getnick` protocol
+- **Broadcast messaging** — every message sent is delivered to all connected peers
+- **Local echo** — senders see their own messages in the chat log immediately
+- **Scrollable chat history** — ring buffer holds up to 512 lines; auto-scrolls to the latest message
+- **Live connection panel** — sidebar shows connected peers; system messages announce connects and disconnects
+- **Non-blocking I/O** — `select()`-based networking with a zero-timeout poll keeps the UI responsive at all times
+- **Both listen and dial** — a node can accept incoming connections, dial out to peers, or do both simultaneously
 
 ---
 
-### 📝 Next Steps for UI Task
-- [ ] Implement a scrolling mechanism for long chat histories.
-- [ ] Connect the `inputText` buffer to the actual `protocol_send` logic once the backend API is ready.
-- [ ] Style the UI to match the "TorChat" theme.
+## Project Structure
+
+```
+torchat/
+├── main.c            Entry point — reads nickname & port, initialises backend, launches UI
+├── backend.c / .h    Core state machine: peer table, protocol logic, callback dispatch
+├── net.c / .h        Raw socket layer: create listener, accept, connect, set non-blocking
+├── peer.c / .h       Peer-list primitives and broadcast helpers
+├── event_loop.c / .h Both a blocking CLI loop and a non-blocking UI-compatible poll loop
+├── Makefile          Cross-platform build (macOS & Linux)
+└── UI/
+    ├── main_ui.c     Raylib/raygui rendering, input handling, backend callback hooks
+    └── raygui.h      Single-header immediate-mode GUI library (bundled)
+```
+
+---
+
+## Dependencies
+
+| Dependency | Purpose | How to install |
+|---|---|---|
+| **GCC** (C11) | Compiler | Ships with most Linux distros; `brew install gcc` on macOS |
+| **Raylib** | Window, rendering, input | `sudo apt install libraylib-dev` · `brew install raylib` |
+| **raygui** | Immediate-mode GUI widgets | Bundled as `UI/raygui.h` — no install needed |
+| **POSIX sockets** | Networking | Standard on Linux & macOS |
+
+> **Windows:** The UI sandbox under `UI/` can be built with MinGW (see below). The main Makefile targets Linux and macOS only.
+
+---
+
+## How to Build & Run
+
+### Linux / macOS (full application)
+
+```bash
+# 1. Install Raylib (pick your platform)
+sudo apt install libraylib-dev      # Debian / Ubuntu
+brew install raylib                  # macOS
+
+# 2. Clone and build
+git clone <repo-url>
+cd torchat
+make
+
+# 3. Run
+./torchat
+```
+
+On startup you will be prompted for:
+- **Nickname** — your display name shown to other peers
+- **Listen port** — the TCP port to accept incoming connections on (enter `0` to skip listening and dial-out only)
+
+### Windows (UI sandbox only)
+
+The `UI/` directory contains a standalone prototype that can be built with MinGW without the backend:
+
+```bash
+cd UI
+gcc main_ui.c -o chat_ui.exe -O1 -Wall -std=c99 -I include/ -L lib/ -lraylib -lopengl32 -lgdi32 -lwinmm
+./chat_ui.exe
+```
+
+### Connecting two peers
+
+**Peer A** (listening):
+```
+Enter nickname: Alice
+Enter listen port (0 to skip): 9000
+```
+
+**Peer B** (dialling out) — use the IP/Port fields in the UI sidebar and click **Connect**:
+```
+IP:   192.168.1.42
+Port: 9000
+```
+
+Once connected, both peers exchange nicknames automatically and can start chatting.
+
+---
+
+## Architecture Overview
+
+TorChat runs in a **single process** with no threads. The UI's render loop drives everything:
+
+```
+while window open:
+    backend_poll()        ← non-blocking select() on all sockets
+    render UI frame       ← Raylib BeginDrawing / EndDrawing
+    handle user input     ← text box, send button, connect form
+```
+
+The backend exposes a clean callback interface so the UI layer never touches sockets directly:
+
+```c
+backend_init(nickname, on_message, on_connected, on_disconnected);
+backend_start_listening(port);       // optional — become a server
+backend_connect_to_peer(ip, port);   // dial out to a peer
+backend_send_message(text);          // broadcast to all peers
+backend_poll();                      // call every frame
+```
+
+---
+
+## Roadmap
+
+- [ ] Wire the Send button to `backend_send_message()` in the merged build
+- [ ] Wire the Connect form to `backend_connect_to_peer()`
+- [ ] Scrollable chat history in the UI
+- [ ] Visual theming and polish
+- [ ] Graceful nickname display in peer sidebar (currently shows fd number)
+- [ ] Message framing / length-prefix to handle split TCP reads
+
+---
+
+## How to Contribute
+
+1. **Fork** the repository and create a branch for your feature or fix:
+   ```bash
+   git checkout -b feature/your-feature-name
+   ```
+
+2. **Follow the coding style** — C11, `-Wall -Wextra`, zero warnings. Run `make` before committing to confirm a clean build.
+
+3. **Keep layers separate.** Networking logic lives in `net.c` / `backend.c`; UI logic lives in `UI/main_ui.c`. Neither layer should reach directly into the other's internals — use the `backend_*` API or the callback interface.
+
+4. **Test with two terminal windows** (or two machines) to verify any networking change end-to-end.
+
+5. **Open a pull request** with a clear description of what changed and why.
+
+### Key files to know before contributing
+
+| File | What to know |
+|---|---|
+| `backend.h` | The public API surface — all UI↔backend interaction goes through here |
+| `net.c` | Socket primitives only; no protocol logic here |
+| `UI/main_ui.c` | UI callbacks (`ui_on_msg`, `ui_on_peer_connected`, etc.) are the integration seam |
+| `event_loop.h` | Contains both blocking (CLI) and non-blocking (UI) loop variants |
