@@ -1,5 +1,6 @@
 #include "backend.h"
 #include "net.h"
+#include "storage.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -73,6 +74,11 @@ void backend_init(const char*  nickname,
 
     g_peer_count  = 0;
     g_listener_fd = -1;
+
+    /* Open (or create) a per-user database: "<nickname>.db" */
+    char db_path[64];
+    snprintf(db_path, sizeof(db_path), "%s.db", g_nickname);
+    storage_open(db_path);
 }
 
 int backend_start_listening(int port)
@@ -167,6 +173,13 @@ void backend_poll(void)
                 send_nick(fd);
             } else {
                 if (g_on_msg) g_on_msg(fd, buf);
+                /* Persist incoming message — tag with sender nickname */
+                peer_info* p = find_peer(fd);
+                storage_save_message(
+                    p ? p->nickname : "unknown",
+                    NULL,   /* peer_addr: not yet tracked per-connection */
+                    buf
+                );
             }
             i++;
         } else {
@@ -189,6 +202,9 @@ void backend_send_message(const char* msg)
     /* Echo locally */
     if (g_on_msg) g_on_msg(-1, formatted);
 
+    /* Persist outgoing message — NULL peer_addr marks it as sent by us */
+    storage_save_message(g_nickname, NULL, formatted);
+
     /* Broadcast */
     for (size_t i = 0; i < g_peer_count; i++)
         send(g_peers[i].fd, formatted, (size_t)n, 0);
@@ -200,6 +216,7 @@ void backend_send_message(const char* msg)
 
 void backend_shutdown(void)
 {
+    storage_close();   /* flush and close DB before sockets go away */
     if (g_listener_fd >= 0) { close(g_listener_fd); g_listener_fd = -1; }
     for (size_t i = 0; i < g_peer_count; i++) close(g_peers[i].fd);
     g_peer_count = 0;

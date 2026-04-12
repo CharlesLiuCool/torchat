@@ -61,7 +61,7 @@ sudo apt install libraylib-dev      # Debian / Ubuntu
 brew install raylib                  # macOS
 
 # 2. Clone and build
-git clone <repo-url>
+git clone https://github.com/CharlesLiuCool/torchat.git
 cd torchat
 make
 

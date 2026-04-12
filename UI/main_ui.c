@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include "raylib.h"
 #include "../backend.h"
+#include "../storage.h"
 
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
@@ -65,6 +66,17 @@ void ui_on_peer_disconnected(int fd)
 }
 
 /* ------------------------------------------------------------------ */
+/* Storage: replay history into the chat log on startup               */
+/* ------------------------------------------------------------------ */
+
+static int replay_cb(const chat_message_t* msg, void* userdata)
+{
+    (void)userdata;
+    chat_push(msg->body);
+    return 0; /* 0 = keep going */
+}
+
+/* ------------------------------------------------------------------ */
 /* run_ui — called from main()                                        */
 /* ------------------------------------------------------------------ */
 
@@ -85,6 +97,12 @@ void run_ui(void)
     /* Peer list scroll */
     int peer_scroll = 0;
     int peer_active = -1;
+
+    /* Replay the last 200 messages from this user's database into the chat log */
+    storage_load_history(200, replay_cb, NULL);
+    if (g_chat.count > 0) {
+        chat_push("--- history ---");
+    }
 
     /* Chat visible area */
     const int CHAT_X     = 220;
