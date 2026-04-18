@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 
 /* ------------------------------------------------------------------ */
 /* Internal state                                                       */
@@ -100,6 +101,7 @@ int storage_open(const char* db_path)
     const char* path = db_path ? db_path : DEFAULT_DB_PATH;
 
     if (sqlite3_open(path, &g_db) != SQLITE_OK) {
+        chmod(path, 0600); /* ensure new DB is user-only readable/writable */
         fprintf(stderr, "[storage] Cannot open database '%s': %s\n",
                 path, sqlite3_errmsg(g_db));
         sqlite3_close(g_db);
@@ -165,13 +167,18 @@ long long storage_save_message(const char* sender,
 {
     if (!g_db || !g_stmt_insert) return -1;
 
+    if (body && strlen(body) > 512) {
+    fprintf(stderr, "[storage] Rejecting oversized message (%zu bytes)\n", strlen(body));
+    return -1;
+}
+
     time_t now = time(NULL);
 
     sqlite3_reset(g_stmt_insert);
     sqlite3_bind_int64(g_stmt_insert, 1, (sqlite3_int64)now);
-    sqlite3_bind_text (g_stmt_insert, 2, sender    ? sender    : "unknown", -1, SQLITE_STATIC);
-    sqlite3_bind_text (g_stmt_insert, 3, (peer_addr && peer_addr[0]) ? peer_addr : NULL, -1, SQLITE_STATIC);
-    sqlite3_bind_text (g_stmt_insert, 4, body      ? body      : "",        -1, SQLITE_STATIC);
+    sqlite3_bind_text (g_stmt_insert, 2, sender    ? sender    : "unknown", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (g_stmt_insert, 3, (peer_addr && peer_addr[0]) ? peer_addr : NULL, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (g_stmt_insert, 4, body      ? body      : "",        -1, SQLITE_TRANSIENT);
 
     int rc = sqlite3_step(g_stmt_insert);
     if (rc != SQLITE_DONE) {

@@ -77,7 +77,21 @@ void backend_init(const char*  nickname,
 
     /* Open (or create) a per-user database: "<nickname>.db" */
     char db_path[64];
-    snprintf(db_path, sizeof(db_path), "%s.db", g_nickname);
+
+    char safe_nick[32];
+    size_t j = 0;
+    for (size_t i = 0; g_nickname[i] && j < sizeof(safe_nick) - 1; i++) {
+        char c = g_nickname[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_') {
+            safe_nick[j++] = c;
+        }
+    }
+    safe_nick[j] = '\0';
+    if (j == 0) { strncpy(safe_nick, "default", sizeof(safe_nick)); }
+
+    char db_path[64];
+    snprintf(db_path, sizeof(db_path), "%s.db", safe_nick);
     storage_open(db_path);
 }
 
