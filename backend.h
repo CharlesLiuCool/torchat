@@ -16,9 +16,14 @@ void backend_init(const char* nickname,
                   peer_cb     on_connected,
                   peer_cb     on_disconnected);
 
+static int       g_listening_port = 0;
+
 int  backend_start_listening(int port);   /* returns listener fd, or -1 */
 int  backend_connect_to_peer(const char* ip, int port); /* returns peer fd, or -1 */
 void backend_shutdown(void);
+
+void backend_set_nickname(const char* nickname);
+int  backend_get_port(void);
 
 /* Called every frame from the UI to drive networking */
 void backend_poll(void);

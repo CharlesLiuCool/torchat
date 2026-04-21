@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <time.h>
 #include "raylib.h"
 #include "../backend.h"
 #include "../storage.h"
@@ -10,7 +11,7 @@
 #include "raygui.h"
 
 /* ------------------------------------------------------------------ */
-/* Per-peer chat log                                                   */
+/* 结构定义与配置                                                       */
 /* ------------------------------------------------------------------ */
 
 #define MAX_PEERS        64
@@ -18,381 +19,547 @@
 #define MAX_LINE_LENGTH  512
 
 typedef struct {
-    int  fd;                                      /* -1 = system/global log  */
-    char addr[64];                                /* "ip:port" for history   */
-    char lines[MAX_CHAT_LINES][MAX_LINE_LENGTH];
+    char text[MAX_LINE_LENGTH];
+    bool is_me;
+    char timestamp[16];
+} chat_msg_t;
+
+typedef struct {
+    int  fd;
+    char addr[64];                                /* 提取出来的纯净昵称 */
+    chat_msg_t messages[MAX_CHAT_LINES];
     int  count;
     int  scroll;
-    int  unread;                                  /* unread badge count      */
+    int  unread;
 } peer_chat_t;
 
-/* Slot 0 is always the system/global log (fd == -1).
-   Slots 1..MAX_PEERS are per-peer conversations.            */
+typedef struct {
+    char nickname[32];
+    char ip[16];
+    int  port;
+} profile_t;
+
 static peer_chat_t g_chats[MAX_PEERS + 1];
-static int         g_chat_count = 1;   /* slot 0 always exists */
-static int         g_active     = 0;   /* currently viewed slot */
+static int         g_chat_count = 1;
+static int         g_active     = 0;
 
-static const char* peer_name_for_fd(int fd);
+static profile_t g_me = { "MyName", "127.0.0.1", 0 };
+static char nickname_buf[32] = "MyName"; 
+static bool nickname_edit = false;
+
+static int bg_theme_idx = 0; // 0:CyberGrid, 1:Matrix, 2:Starfield, 3:Minimal
+static float global_time = 0.0f; // 用于动画
 
 /* ------------------------------------------------------------------ */
-/* Chat helpers                                                        */
+/* 字符串清洗器：解决 TCP 粘包导致的 /getnick 尾巴                       */
 /* ------------------------------------------------------------------ */
+static void clean_nickname(char* name) {
+    if (!name) return;
+    // 斩断 TCP 粘包传来的指令尾巴
+    char* p = strstr(name, "/getnick");
+    if (p) *p = '\0';
+    p = strstr(name, "/nick");
+    if (p) *p = '\0';
+    
+    // 移除尾部换行或空格
+    int len = strlen(name);
+    while (len > 0 && (name[len-1] == '\n' || name[len-1] == '\r' || name[len-1] == ' ')) {
+        name[len-1] = '\0';
+        len--;
+    }
+}
 
-static peer_chat_t* chat_for_fd(int fd)
-{
+/* ------------------------------------------------------------------ */
+/* 极客风像素头像生成器 (8-bit Identicon)                              */
+/* ------------------------------------------------------------------ */
+/* 类似 GitHub 的对称像素格生成器，基于名字哈希，独一无二且充满科技感 */
+static void DrawIdenticon(int cx, int cy, int radius, const char* seedStr) {
+    unsigned int hash = 5381;
+    const char* p = seedStr;
+    while (*p) { hash = ((hash << 5) + hash) + *p++; }
+    
+    // 颜色池
+    Color colors[] = { 
+        (Color){50, 205, 50, 255},  // 霓虹绿
+        (Color){0, 191, 255, 255},  // 深空蓝
+        (Color){255, 105, 180, 255},// 赛博粉
+        (Color){255, 165, 0, 255},  // 警戒橙
+        (Color){147, 112, 219, 255},// 迷幻紫
+        (Color){255, 215, 0, 255}   // 黄金
+    };
+    Color fg = colors[hash % 6];
+    Color bg = GetColor(0x1a1a2eff); // 深色底
+
+    // 绘制头像底框
+    int size = radius * 2;
+    int startX = cx - radius;
+    int startY = cy - radius;
+    DrawRectangleRounded((Rectangle){(float)startX, (float)startY, (float)size, (float)size}, 0.2f, 4, bg);
+    DrawRectangleRoundedLinesEx((Rectangle){(float)startX, (float)startY, (float)size, (float)size}, 0.2f, 4, 1.5f, fg);
+
+    // 5x5 对称像素阵列
+    int gridSize = 5;
+    int cellSize = (size - 6) / gridSize;
+    int padX = startX + 3 + (size - 6 - cellSize * 5) / 2;
+    int padY = startY + 3 + (size - 6 - cellSize * 5) / 2;
+
+    for (int x = 0; x < 3; x++) { // 画左半边和中轴
+        for (int y = 0; y < 5; y++) {
+            // 用哈希的二进制位决定是否填充
+            int bitIndex = (x * 5 + y);
+            if ((hash >> bitIndex) & 1) {
+                // 左侧方块
+                DrawRectangle(padX + x * cellSize, padY + y * cellSize, cellSize, cellSize, fg);
+                // 对称镜像右侧方块
+                if (x < 2) {
+                    DrawRectangle(padX + (4 - x) * cellSize, padY + y * cellSize, cellSize, cellSize, fg);
+                }
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 动态背景渲染引擎 (Animated Background Themes)                         */
+/* ------------------------------------------------------------------ */
+static void DrawCoolBackground(int x, int y, int w, int h) {
+    global_time += GetFrameTime();
+    
+    // 限制绘制区域，避免背景溢出到侧边栏
+    BeginScissorMode(x, y, w, h);
+
+    if (bg_theme_idx == 0) {
+        // Theme 0: 赛博网格扫描 (Cyber Grid)
+        ClearBackground(GetColor(0x0a0a15ff));
+        float offset = (global_time * 20.0f);
+        int gridSize = 40;
+        int shiftY = (int)offset % gridSize;
+        int shiftX = (int)(offset * 0.5f) % gridSize;
+
+        for (int i = -gridSize; i < w + gridSize; i += gridSize) {
+            DrawLine(x + i + shiftX, y, x + i + shiftX, y + h, Fade(DARKBLUE, 0.4f));
+        }
+        for (int i = -gridSize; i < h + gridSize; i += gridSize) {
+            DrawLine(x, y + i + shiftY, x + w, y + i + shiftY, Fade(DARKBLUE, 0.4f));
+        }
+    } 
+    else if (bg_theme_idx == 1) {
+        // Theme 1: 黑客帝国数字雨 (Matrix Rain)
+        ClearBackground(GetColor(0x051005ff));
+        for (int i = 0; i < w; i += 30) {
+            float speed = 30.0f + (i % 50);
+            int dropY = (int)(global_time * speed + i * 7) % (h + 100) - 50;
+            DrawText(TextFormat("%d", (i % 2)), x + i, y + dropY, 14, Fade(GREEN, 0.7f));
+            DrawText(TextFormat("%d", ((i+1) % 2)), x + i, y + dropY - 20, 14, Fade(DARKGREEN, 0.4f));
+        }
+    }
+    else if (bg_theme_idx == 2) {
+        // Theme 2: 深空星流 (Starfield)
+        ClearBackground(GetColor(0x050510ff));
+        for (int i = 0; i < 50; i++) {
+            float speed = 10.0f + (i % 30);
+            int starX = w - (int)(global_time * speed + i * 40) % w;
+            int starY = (i * i * 17) % h;
+            DrawRectangle(x + starX, y + starY, (i%3)+1, (i%3)+1, Fade(WHITE, (i%5)*0.2f + 0.2f));
+        }
+    }
+    else {
+        // Theme 3: 极简纯净 (Minimal)
+        ClearBackground(GetColor(0x111116ff));
+    }
+
+    // 叠加 CRT 扫描线质感滤镜
+    for (int i = 0; i < h; i += 4) {
+        DrawLine(x, y + i, x + w, y + i, Fade(BLACK, 0.2f));
+    }
+
+    EndScissorMode();
+}
+
+/* ------------------------------------------------------------------ */
+/* 文本表情替换器 (Emoji Replacer)                                     */
+/* ------------------------------------------------------------------ */
+static void replace_emojis(char* str) {
+    char temp[MAX_LINE_LENGTH] = {0};
+    char* src = str;
+    char* dst = temp;
+    
+    while (*src && (dst - temp) < (MAX_LINE_LENGTH - 10)) {
+        if (strncmp(src, ":smile:", 7) == 0) { strcpy(dst, "(^_^)"); dst += 5; src += 7; }
+        else if (strncmp(src, ":sad:", 5) == 0) { strcpy(dst, "(T_T)"); dst += 5; src += 5; }
+        else if (strncmp(src, ":heart:", 7) == 0) { strcpy(dst, "<3"); dst += 2; src += 7; }
+        else if (strncmp(src, ":lol:", 5) == 0) { strcpy(dst, "xD"); dst += 2; src += 5; }
+        else if (strncmp(src, ":angry:", 7) == 0) { strcpy(dst, "(>_<)"); dst += 5; src += 7; }
+        else { *dst++ = *src++; }
+    }
+    *dst = '\0';
+    strncpy(str, temp, MAX_LINE_LENGTH - 1);
+    str[MAX_LINE_LENGTH - 1] = '\0';
+}
+
+/* ------------------------------------------------------------------ */
+/* 辅助函数                                                            */
+/* ------------------------------------------------------------------ */
+static const char* get_timestamp(void) {
+    static char buf[10];
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    strftime(buf, sizeof(buf), "%H:%M", t);
+    return buf;
+}
+
+static peer_chat_t* chat_for_fd(int fd) {
     for (int i = 0; i < g_chat_count; i++)
-        if (g_chats[i].fd == fd)
-            return &g_chats[i];
+        if (g_chats[i].fd == fd) return &g_chats[i];
     return NULL;
 }
 
-static peer_chat_t* chat_get_or_create(int fd)
-{
+static peer_chat_t* chat_get_or_create(int fd) {
     peer_chat_t* c = chat_for_fd(fd);
     if (c) return c;
-    if (g_chat_count > MAX_PEERS) return &g_chats[0]; /* fallback to system */
+    if (g_chat_count > MAX_PEERS) return &g_chats[0];
     c = &g_chats[g_chat_count++];
     memset(c, 0, sizeof(*c));
     c->fd = fd;
+    strncpy(c->addr, "UNKNOWN", sizeof(c->addr) - 1);
     return c;
 }
 
-/* Look up by addr string (used when replaying history — fds don't persist) */
-static peer_chat_t* chat_get_or_create_by_addr(const char* addr)
-{
+static peer_chat_t* chat_get_or_create_by_addr(const char* addr) {
     for (int i = 1; i < g_chat_count; i++)
-        if (strcmp(g_chats[i].addr, addr) == 0)
-            return &g_chats[i];
+        if (strcmp(g_chats[i].addr, addr) == 0) return &g_chats[i];
     if (g_chat_count > MAX_PEERS) return &g_chats[0];
     peer_chat_t* c = &g_chats[g_chat_count++];
     memset(c, 0, sizeof(*c));
-    c->fd = -2;   /* placeholder: no live fd yet */
+    c->fd = -2;
     strncpy(c->addr, addr, sizeof(c->addr) - 1);
     return c;
 }
 
-static void chat_push_to(peer_chat_t* c, const char* msg)
-{
-    if (!c) return;
+static void chat_push_to(peer_chat_t* c, const char* clean_msg, bool is_me) {
+    if (!c || clean_msg[0] == '\0') return;
+    chat_msg_t* m;
+    
     if (c->count < MAX_CHAT_LINES) {
-        strncpy(c->lines[c->count], msg, MAX_LINE_LENGTH - 1);
-        c->lines[c->count][MAX_LINE_LENGTH - 1] = '\0';
-        c->count++;
+        m = &c->messages[c->count++];
     } else {
-        memmove(c->lines[0], c->lines[1],
-                sizeof(c->lines[0]) * (MAX_CHAT_LINES - 1));
-        strncpy(c->lines[MAX_CHAT_LINES - 1], msg, MAX_LINE_LENGTH - 1);
-        c->lines[MAX_CHAT_LINES - 1][MAX_LINE_LENGTH - 1] = '\0';
+        memmove(&c->messages[0], &c->messages[1], sizeof(c->messages[0]) * (MAX_CHAT_LINES - 1));
+        m = &c->messages[MAX_CHAT_LINES - 1];
     }
-    /* auto-scroll to bottom */
+    
+    strncpy(m->text, clean_msg, MAX_LINE_LENGTH - 1);
+    m->text[MAX_LINE_LENGTH - 1] = '\0';
+    m->is_me = is_me;
+    strncpy(m->timestamp, get_timestamp(), sizeof(m->timestamp) - 1);
+
     c->scroll = c->count;
-
-    /* increment unread badge if this is not the active chat */
-    if (c != &g_chats[g_active])
-        c->unread++;
+    if (c != &g_chats[g_active]) c->unread++;
 }
 
-static void chat_push_system(const char* msg)
-{
-    /* Push to system log AND to the active peer log so context isn't lost */
-    chat_push_to(&g_chats[0], msg);
+static void chat_push_system(const char* msg) {
+    chat_push_to(&g_chats[0], msg, false);
 }
 
-/* ------------------------------------------------------------------ */
-/* Backend callbacks                                                   */
-/* ------------------------------------------------------------------ */
-
-void ui_on_msg(int fd, const char* msg)
-{
-    peer_chat_t* c = chat_get_or_create(fd);
-    chat_push_to(c, msg);
-}
-
-void ui_on_peer_connected(int fd)
-{
-    char line[MAX_LINE_LENGTH];
-    snprintf(line, sizeof(line), "*** Peer %d connected", fd);
-    chat_push_system(line);
-    /* Create the peer's chat slot now so it appears in the sidebar */
-    peer_chat_t* c = chat_get_or_create(fd);
-    /* Stamp the addr from the backend name (usually "ip:port") */
-    const char* name = peer_name_for_fd(fd);
-    if (name) strncpy(c->addr, name, sizeof(c->addr) - 1);
-}
-
-void ui_on_peer_disconnected(int fd)
-{
-    char line[MAX_LINE_LENGTH];
-    snprintf(line, sizeof(line), "*** Peer %d disconnected", fd);
-    chat_push_system(line);
-    /* Optionally push a note into the peer's own log too */
-    peer_chat_t* c = chat_for_fd(fd);
-    if (c) chat_push_to(c, "*** Disconnected");
-}
-
-/* ------------------------------------------------------------------ */
-/* Peer name lookup by fd (backend only exposes by index)             */
-/* ------------------------------------------------------------------ */
-
-static const char* peer_name_for_fd(int fd)
-{
+static const char* peer_name_for_fd(int fd) {
     for (size_t i = 0; i < backend_peer_count(); i++)
-        if (backend_peer_fd(i) == fd)
-            return backend_peer_name(i);
+        if (backend_peer_fd(i) == fd) return backend_peer_name(i);
     return NULL;
 }
 
+static void parse_and_push_incoming(peer_chat_t* c, const char* raw_msg) {
+    char sender_name[64] = {0};
+    const char* actual_msg = raw_msg;
+    bool is_me = false;
+
+    if (raw_msg[0] == '[') {
+        const char* end_bracket = strchr(raw_msg, ']');
+        if (end_bracket) {
+            int name_len = end_bracket - raw_msg - 1;
+            if (name_len > 0 && name_len < 63) {
+                strncpy(sender_name, raw_msg + 1, name_len);
+                sender_name[name_len] = '\0';
+                
+                clean_nickname(sender_name); // 斩断粘包的脏数据
+                
+                actual_msg = end_bracket + 1;
+                if (*actual_msg == ':') actual_msg++;
+                if (*actual_msg == ' ') actual_msg++;
+
+                if (strcmp(sender_name, g_me.nickname) == 0) {
+                    is_me = true;
+                }
+            }
+        }
+    }
+    
+    chat_push_to(c, actual_msg, is_me);
+}
+
 /* ------------------------------------------------------------------ */
-/* Storage replay                                                      */
+/* 后端回调函数                                                         */
 /* ------------------------------------------------------------------ */
 
-static int replay_cb(const chat_message_t* msg, void* userdata)
-{
+void ui_on_msg(int fd, const char* msg) {
+    if (fd == -1) return; 
+    peer_chat_t* c = chat_get_or_create(fd);
+    parse_and_push_incoming(c, msg);
+}
+
+void ui_on_peer_connected(int fd) {
+    chat_push_system(TextFormat("*** Peer %d joined the network", fd));
+    peer_chat_t* c = chat_get_or_create(fd); 
+    chat_push_to(c, "*** Tip: Type :smile:, :sad:, :heart:, :lol:, :angry: for emojis!", false);
+}
+
+void ui_on_peer_disconnected(int fd) {
+    chat_push_system(TextFormat("*** Peer %d disconnected", fd));
+    peer_chat_t* c = chat_for_fd(fd);
+    if (c) chat_push_to(c, "*** Disconnected", false);
+}
+
+static int replay_cb(const chat_message_t* msg, void* userdata) {
     (void)userdata;
-    /* Route by peer_addr if present (fd won't survive restarts anyway) */
     peer_chat_t* c = (msg->peer_addr && msg->peer_addr[0] != '\0')
                      ? chat_get_or_create_by_addr(msg->peer_addr)
                      : &g_chats[0];
-    chat_push_to(c, msg->body);
+    parse_and_push_incoming(c, msg->body);
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* run_ui                                                              */
+/* UI 渲染组件                                                         */
 /* ------------------------------------------------------------------ */
 
-void run_ui(void)
-{
-    const int W = 900, H = 620;
+void DrawChatBubble(chat_msg_t* m, const char* peerName, int x, int y, int maxWidth) {
+    int fontSize = 14;
+    int padding = 10;
+    int avatarRadius = 18;
+    
+    int textWidth = MeasureText(m->text, fontSize);
+    int bubbleWidth = textWidth + padding * 2;
+    if (bubbleWidth > maxWidth) bubbleWidth = maxWidth;
+    
+    // 简易处理多行气泡高度
+    int bubbleHeight = 36 + (textWidth / maxWidth) * 16; 
+
+    const char* senderName = m->is_me ? g_me.nickname : peerName;
+    int nameWidth = MeasureText(senderName, 11);
+    int timeWidth = MeasureText(m->timestamp, 10);
+
+    int avatarX, bubbleX;
+
+    if (m->is_me) {
+        avatarX = x - avatarRadius;
+        bubbleX = avatarX - avatarRadius - 12 - bubbleWidth;
+        
+        DrawText(senderName, bubbleX + bubbleWidth - nameWidth, y, 11, SKYBLUE);
+        DrawText(m->timestamp, bubbleX + bubbleWidth - nameWidth - timeWidth - 8, y + 1, 10, DARKGRAY);
+    } else {
+        avatarX = x + avatarRadius;
+        bubbleX = avatarX + avatarRadius + 12;
+        
+        DrawText(senderName, bubbleX, y, 11, LIGHTGRAY);
+        DrawText(m->timestamp, bubbleX + nameWidth + 8, y + 1, 10, DARKGRAY);
+    }
+
+    DrawIdenticon(avatarX, y + 22, avatarRadius, senderName);
+
+    y += 18; 
+    Color bubbleColor = m->is_me ? GetColor(0x1c4a8aff) : GetColor(0x2d2d44ff);
+    DrawRectangleRounded((Rectangle){(float)bubbleX, (float)y, (float)bubbleWidth, (float)bubbleHeight}, 0.3f, 8, bubbleColor);
+    DrawText(m->text, bubbleX + padding, y + 10, fontSize, WHITE);
+}
+
+/* ------------------------------------------------------------------ */
+/* 运行 UI                                                            */
+/* ------------------------------------------------------------------ */
+
+void run_ui(void) {
+    const int W = 950, H = 650;
     InitWindow(W, H, "TorChat");
     SetTargetFPS(60);
 
-    /* Initialise system log slot */
     g_chats[0].fd = -1;
-    chat_push_to(&g_chats[0], "--- TorChat system log ---");
+    chat_push_system("--- TorChat system log ---");
+    chat_push_system("*** Tip: Type :smile:, :sad:, :heart:, :lol:, :angry: for emojis!");
 
-    /* Replay history */
     storage_load_history(200, replay_cb, NULL);
 
-    /* Input state */
     char msg_buf[256] = {0};
     char ip_buf[64]   = {"127.0.0.1"};
     char port_buf[12] = {"9000"};
-    bool msg_edit     = false;
-    bool ip_edit      = false;
-    bool port_edit    = false;
+    bool msg_edit = false, ip_edit = false, port_edit = false;
 
-    /* Layout constants */
-    const int SIDEBAR_W  = 210;
-    const int CHAT_X     = SIDEBAR_W + 10;
-    const int CHAT_Y     = 10;
-    const int CHAT_W     = W - CHAT_X - 5;
-    const int CHAT_H     = 470;
-    const int LINE_H     = 18;
-    const int VISIBLE    = (CHAT_H - 10) / LINE_H;
+    const int SIDEBAR_W = 240;
+    const int CHAT_X = SIDEBAR_W + 15;
+    const int CHAT_W = W - CHAT_X - 10;
+    const int CHAT_H = 480;
+
+    backend_set_nickname(g_me.nickname);
 
     while (!WindowShouldClose()) {
-        /* ---- Network tick ---- */
         backend_poll();
 
-        /* ---- Active chat pointer ---- */
-        peer_chat_t* active_chat = &g_chats[g_active];
-
-        /* ---- Mouse-wheel scroll ---- */
-        float wheel = GetMouseWheelMove();
-        if (wheel != 0.0f) {
-            active_chat->scroll -= (int)wheel * 3;
-            if (active_chat->scroll < 0)
-                active_chat->scroll = 0;
-            if (active_chat->scroll > active_chat->count)
-                active_chat->scroll = active_chat->count;
-        }
-
-        /* ---- Enter to send (to the selected peer) ---- */
-        if (msg_edit && IsKeyPressed(KEY_ENTER) && msg_buf[0] != '\0') {
-            if (g_active > 0) {
-                /* NOTE: backend only supports broadcast. If you add
-                 * backend_send_message_to(int fd, const char*) later,
-                 * replace this call. For now all peers receive the message. */
-                backend_send_message(msg_buf);
-                char echo[MAX_LINE_LENGTH];
-                snprintf(echo, sizeof(echo), "[you] %s", msg_buf);
-                chat_push_to(active_chat, echo);
-            } else {
-                chat_push_to(&g_chats[0], "*** Select a peer before sending.");
-            }
-            msg_buf[0] = '\0';
-        }
-
-        BeginDrawing();
-        ClearBackground(GetColor(0x1a1a2eff));
-
-        /* ============================================================
-         * LEFT SIDEBAR — peer conversation list + connect form
-         * ============================================================ */
-        DrawRectangle(5, 5, SIDEBAR_W, H - 10, GetColor(0x12122aff));
-        DrawRectangleLines(5, 5, SIDEBAR_W, H - 10, GetColor(0x3333aaff));
-
-        GuiLabel((Rectangle){15, 12, SIDEBAR_W - 20, 20}, "# CONVERSATIONS");
-
-        /* Draw each chat slot as a clickable row */
-        int row_y = 36;
-        for (int i = 0; i < g_chat_count; i++) {
-            Rectangle row = {10, row_y, SIDEBAR_W - 10, 26};
-            bool hovered  = CheckCollisionPointRec(GetMousePosition(), row);
-            bool selected = (i == g_active);
-
-            Color bg = selected  ? GetColor(0x2a2a6aff) :
-                       hovered   ? GetColor(0x1e1e4aff) :
-                                   GetColor(0x12122aff);
-            DrawRectangleRec(row, bg);
-            if (selected)
-                DrawRectangleLinesEx(row, 1, GetColor(0x5555ccff));
-
-            /* Label */
-            char label[48];
-            if (g_chats[i].fd == -1) {
-                snprintf(label, sizeof(label), "System log");
-            } else {
-                /* Prefer live backend name, fall back to stored addr, then fd */
-                const char* name = (g_chats[i].fd >= 0)
-                                   ? peer_name_for_fd(g_chats[i].fd)
-                                   : NULL;
-                if (!name || name[0] == '\0') name = g_chats[i].addr;
-                snprintf(label, sizeof(label), "Peer %s",
-                         (name && name[0]) ? name : TextFormat("%d", g_chats[i].fd));
-            }
-            DrawText(label, row.x + 6, row.y + 6, 13,
-                     selected ? WHITE : GetColor(0xaaaadbff));
-
-            /* Unread badge */
-            if (g_chats[i].unread > 0) {
-                char badge[8];
-                snprintf(badge, sizeof(badge), "%d", g_chats[i].unread);
-                int bw = MeasureText(badge, 11) + 8;
-                DrawRectangle((int)(row.x + row.width - bw - 4),
-                              (int)(row.y + 5), bw, 16,
-                              GetColor(0xcc3333ff));
-                DrawText(badge, (int)(row.x + row.width - bw),
-                         (int)(row.y + 7), 11, WHITE);
-            }
-
-            if (hovered && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-                g_active = i;
-                g_chats[i].unread = 0;    /* clear badge on open */
-            }
-
-            row_y += 30;
-            if (row_y > H - 180) break;   /* don't overflow into connect form */
-        }
-
-        /* ---- Connect section ---- */
-        int conn_y = H - 165;
-        DrawLine(10, conn_y, SIDEBAR_W, conn_y, GetColor(0x3333aaff));
-        GuiLabel((Rectangle){15, conn_y + 6, SIDEBAR_W - 20, 18}, "CONNECT TO PEER");
-
-        GuiLabel((Rectangle){15, conn_y + 28, 30, 18}, "IP:");
-        if (GuiTextBox((Rectangle){50, conn_y + 26, SIDEBAR_W - 55, 22},
-                       ip_buf, sizeof(ip_buf), ip_edit))
-            ip_edit = !ip_edit;
-
-        GuiLabel((Rectangle){15, conn_y + 56, 40, 18}, "Port:");
-        if (GuiTextBox((Rectangle){60, conn_y + 54, 60, 22},
-                       port_buf, sizeof(port_buf), port_edit))
-            port_edit = !port_edit;
-
-        if (GuiButton((Rectangle){125, conn_y + 54, 75, 22}, "Connect")) {
-            int p = atoi(port_buf);
-            if (p > 0 && ip_buf[0] != '\0') {
-                int fd = backend_connect_to_peer(ip_buf, p);
-                if (fd < 0) {
-                    chat_push_system("*** Connection failed");
-                } else {
-                    /* Switch to the new peer's chat immediately */
-                    peer_chat_t* nc = chat_get_or_create(fd);
-                    for (int i = 0; i < g_chat_count; i++) {
-                        if (&g_chats[i] == nc) { g_active = i; break; }
+        g_me.port = backend_get_port();
+        for (int i = 1; i < g_chat_count; i++) {
+            if (g_chats[i].fd >= 0) {
+                const char* real_name = peer_name_for_fd(g_chats[i].fd);
+                if (real_name && real_name[0] != '\0') {
+                    char temp_name[64];
+                    strncpy(temp_name, real_name, sizeof(temp_name) - 1);
+                    temp_name[63] = '\0';
+                    clean_nickname(temp_name); // 更新好友名字前先洗干净粘包残余
+                    if (strcmp(temp_name, "UNKNOWN") != 0) {
+                        strncpy(g_chats[i].addr, temp_name, sizeof(g_chats[i].addr) - 1);
                     }
                 }
             }
         }
 
-        /* ============================================================
-         * CHAT AREA — shows the active conversation
-         * ============================================================ */
-        DrawRectangle(CHAT_X, CHAT_Y, CHAT_W, CHAT_H, GetColor(0x0e0e20ff));
-        DrawRectangleLines(CHAT_X, CHAT_Y, CHAT_W, CHAT_H, GetColor(0x3333aaff));
+        peer_chat_t* active_chat = &g_chats[g_active];
 
-        /* Header bar showing who we're talking to */
-        {
-            const char* title = (active_chat->fd == -1)
-                                ? "System Log"
-                                : TextFormat("Chat with Peer %d", active_chat->fd);
-            DrawRectangle(CHAT_X + 1, CHAT_Y + 1, CHAT_W - 2, 20,
-                          GetColor(0x1e1e4aff));
-            DrawText(title, CHAT_X + 8, CHAT_Y + 4, 13,
-                     GetColor(0x88ccffff));
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0) {
+            active_chat->scroll -= (int)wheel * 2;
+            if (active_chat->scroll < 0) active_chat->scroll = 0;
         }
 
-        /* Message lines */
-        int first = active_chat->scroll - VISIBLE;
-        if (first < 0) first = 0;
-
-        int y = CHAT_Y + 26;
-        for (int i = first;
-             i < active_chat->count && y < CHAT_Y + CHAT_H - LINE_H;
-             i++) {
-            Color col = WHITE;
-            if (strncmp(active_chat->lines[i], "***", 3) == 0)
-                col = GetColor(0x888888ff);
-            else if (strncmp(active_chat->lines[i], "[you]", 5) == 0)
-                col = GetColor(0xaaffaaff);
-            else if (strncmp(active_chat->lines[i], "[", 1) == 0)
-                col = GetColor(0x88ccffff);
-            DrawText(active_chat->lines[i], CHAT_X + 6, y, 14, col);
-            y += LINE_H;
+        /* 修复1：发送消息时不再进行二次打包 */
+        if (msg_edit && IsKeyPressed(KEY_ENTER) && msg_buf[0] != '\0') {
+            if (g_active > 0) {
+                replace_emojis(msg_buf);
+                
+                // 直接发 msg_buf，backend_send_message 会自动包上 [MyName]:
+                backend_send_message(msg_buf); 
+                
+                // 本地回显直接记录纯消息
+                chat_push_to(active_chat, msg_buf, true);
+                msg_buf[0] = '\0';
+            }
         }
 
-        if (active_chat->scroll < active_chat->count) {
-            DrawText("(scroll down for more)",
-                     CHAT_X + CHAT_W - 200, CHAT_Y + CHAT_H - 18,
-                     11, GetColor(0x555577ff));
+        BeginDrawing();
+        ClearBackground(GetColor(0x0a0a12ff));
+
+        /* ================= 左侧侧边栏 ================= */
+        DrawRectangle(5, 5, SIDEBAR_W, H - 10, GetColor(0x12121fff));
+        DrawRectangleLines(5, 5, SIDEBAR_W, H - 10, GetColor(0x2a2a4aff));
+
+        /* 1. 个人资料区域 (Profile) */
+        DrawIdenticon(35, 45, 20, g_me.nickname); // 用像素风头像替换
+
+        if (GuiTextBox((Rectangle){65, 25, 115, 24}, nickname_buf, 32, nickname_edit))
+            nickname_edit = !nickname_edit;
+        
+        if (GuiButton((Rectangle){185, 25, 45, 24}, "Save")) {
+            strncpy(g_me.nickname, nickname_buf, 31);
+            g_me.nickname[31] = '\0';
+            nickname_edit = false;
+            backend_set_nickname(g_me.nickname);
         }
 
-        /* ============================================================
-         * INPUT BAR
-         * ============================================================ */
-        int INPUT_Y = CHAT_Y + CHAT_H + 8;
-        DrawRectangle(CHAT_X, INPUT_Y, CHAT_W, 50, GetColor(0x12122aff));
-        DrawRectangleLines(CHAT_X, INPUT_Y, CHAT_W, 50, GetColor(0x3333aaff));
+        DrawText(TextFormat("IP: %s:%d", g_me.ip, g_me.port), 65, 58, 11, GRAY);
 
-        bool can_send = (g_active > 0);   /* can't send from system log */
+        if (GuiButton((Rectangle){185, 55, 45, 20}, "Theme")) {
+            bg_theme_idx = (bg_theme_idx + 1) % 4; // 切换炫酷背景
+        }
 
-        if (can_send) {
-            if (GuiTextBox((Rectangle){CHAT_X + 4, INPUT_Y + 6, CHAT_W - 90, 38},
-                           msg_buf, sizeof(msg_buf), msg_edit))
+        DrawLine(15, 90, SIDEBAR_W - 10, 90, GetColor(0x2a2a4aff));
+        GuiLabel((Rectangle){15, 100, SIDEBAR_W - 20, 20}, "# CONVERSATIONS");
+
+        /* 2. 聊天列表 */
+        int row_y = 130;
+        for (int i = 0; i < g_chat_count; i++) {
+            Rectangle row = {12, (float)row_y, (float)SIDEBAR_W - 15, 40};
+            bool hovered = CheckCollisionPointRec(GetMousePosition(), row);
+            bool selected = (i == g_active);
+
+            if (selected) DrawRectangleRounded(row, 0.2f, 6, GetColor(0x252545ff));
+            else if (hovered) DrawRectangleRounded(row, 0.2f, 6, GetColor(0x1a1a2eff));
+
+            Color statusColor = (g_chats[i].fd == -1) ? BLUE : (g_chats[i].fd >= 0 ? GREEN : RED);
+            DrawCircle(25, row_y + 20, 4, statusColor);
+
+            const char* name = (g_chats[i].fd == -1) ? "System Log" : g_chats[i].addr;
+            
+            if (g_chats[i].fd != -1) {
+                DrawIdenticon(45, row_y + 20, 10, name); // 列表里也用像素头像
+                DrawText(name, 65, row_y + 14, 13, selected ? WHITE : LIGHTGRAY);
+            } else {
+                DrawText(name, 45, row_y + 14, 13, selected ? WHITE : LIGHTGRAY);
+            }
+
+            if (g_chats[i].unread > 0) {
+                DrawRectangle(SIDEBAR_W - 35, row_y + 12, 20, 16, RED);
+                DrawText(TextFormat("%d", g_chats[i].unread), SIDEBAR_W - 30, row_y + 15, 10, WHITE);
+            }
+
+            if (hovered && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                g_active = i;
+                g_chats[i].unread = 0;
+            }
+            row_y += 45;
+            if (row_y > H - 170) break;
+        }
+
+        /* 3. 连接表单 */
+        int conn_y = H - 160;
+        DrawLine(15, conn_y, SIDEBAR_W - 10, conn_y, GetColor(0x2a2a4aff));
+        GuiLabel((Rectangle){15, conn_y + 5, 150, 20}, "CONNECT TO PEER");
+        if (GuiTextBox((Rectangle){15, conn_y + 30, 215, 24}, ip_buf, 64, ip_edit)) ip_edit = !ip_edit;
+        if (GuiTextBox((Rectangle){15, conn_y + 60, 80, 24}, port_buf, 12, port_edit)) port_edit = !port_edit;
+        if (GuiButton((Rectangle){105, conn_y + 60, 125, 24}, "Connect")) {
+            backend_connect_to_peer(ip_buf, atoi(port_buf));
+        }
+
+        /* ================= 右侧聊天区域 ================= */
+        // 渲染动态背景
+        DrawCoolBackground(CHAT_X, 10, CHAT_W, CHAT_H);
+        DrawRectangleLines(CHAT_X, 10, CHAT_W, CHAT_H, GetColor(0x2a2a4aff));
+        
+        DrawRectangle(CHAT_X + 1, 11, CHAT_W - 2, 25, GetColor(0x1a1a2eff));
+        const char* chatTitle = (active_chat->fd == -1) ? "System Console" : TextFormat("Peer: %s", active_chat->addr);
+        DrawText(chatTitle, CHAT_X + 10, 17, 13, SKYBLUE);
+
+        /* 气泡渲染 */
+        int curr_y = 50;
+        int start_idx = active_chat->scroll - 6; 
+        if (start_idx < 0) start_idx = 0;
+
+        for (int i = start_idx; i < active_chat->count && curr_y < CHAT_H - 20; i++) {
+            chat_msg_t* m = &active_chat->messages[i];
+            bool isSys = (active_chat->fd == -1) || (strstr(m->text, "***") == m->text);
+
+            if (isSys) {
+                int txtW = MeasureText(m->text, 12);
+                DrawText(m->text, CHAT_X + CHAT_W/2 - txtW/2, curr_y, 12, GetColor(0xaaaaaaff));
+                curr_y += 25;
+            } else {
+                int boundsX = m->is_me ? (CHAT_X + CHAT_W - 15) : (CHAT_X + 15);
+                DrawChatBubble(m, active_chat->addr, boundsX, curr_y, CHAT_W - 120);
+                curr_y += 65; 
+            }
+        }
+
+        /* 底部输入栏 */
+        int input_y = CHAT_H + 25;
+        if (g_active > 0) {
+            if (GuiTextBox((Rectangle){(float)CHAT_X, (float)input_y, (float)CHAT_W - 90, 45}, msg_buf, 256, msg_edit))
                 msg_edit = !msg_edit;
-
-            if (GuiButton((Rectangle){CHAT_X + CHAT_W - 82, INPUT_Y + 6, 78, 38}, "SEND")) {
+            
+            if (GuiButton((Rectangle){(float)CHAT_X + CHAT_W - 80, (float)input_y, 80, 45}, "SEND")) {
                 if (msg_buf[0] != '\0') {
-                    backend_send_message(msg_buf); /* broadcast; see note above */
-                    char echo[MAX_LINE_LENGTH];
-                    snprintf(echo, sizeof(echo), "[you] %s", msg_buf);
-                    chat_push_to(active_chat, echo);
+                    replace_emojis(msg_buf); 
+                    backend_send_message(msg_buf); // 修复2: 按钮发送也去掉多余拼接
+                    chat_push_to(active_chat, msg_buf, true);
                     msg_buf[0] = '\0';
                 }
             }
         } else {
-            DrawText("Select a peer conversation to send a message.",
-                     CHAT_X + 10, INPUT_Y + 16, 13, GetColor(0x555577ff));
+            DrawText("System log is read-only.", CHAT_X + 10, input_y + 15, 15, DARKGRAY);
         }
 
-        /* ============================================================
-         * Status bar
-         * ============================================================ */
-        DrawText(TextFormat("Peers: %zu  |  Scroll: mouse wheel  |  Conversations: %d",
-                            backend_peer_count(), g_chat_count - 1),
-                 CHAT_X + 4, H - 16, 11, GetColor(0x555577ff));
+        DrawText(TextFormat("Peers: %zu  |  Profile: %s  |  Status: Online", backend_peer_count(), g_me.nickname), CHAT_X, H - 20, 11, GRAY);
 
         EndDrawing();
     }

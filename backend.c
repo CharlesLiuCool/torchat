@@ -90,7 +90,6 @@ void backend_init(const char*  nickname,
     safe_nick[j] = '\0';
     if (j == 0) { strncpy(safe_nick, "default", sizeof(safe_nick)); }
 
-    char db_path[64];
     snprintf(db_path, sizeof(db_path), "%s.db", safe_nick);
     storage_open(db_path);
 }
@@ -98,7 +97,22 @@ void backend_init(const char*  nickname,
 int backend_start_listening(int port)
 {
     g_listener_fd = create_listener(port);
+    if (g_listener_fd >= 0) {
+        g_listening_port = port; // <--- 确保在这里记录了真实端口
+    }
     return g_listener_fd;
+}
+
+int backend_get_port(void) {
+    return g_listening_port;
+}
+
+void backend_set_nickname(const char* nickname) {
+    strncpy(g_nickname, nickname, sizeof(g_nickname) - 1);
+    g_nickname[sizeof(g_nickname) - 1] = '\0';
+    for (size_t i = 0; i < g_peer_count; i++) {
+        send_nick(g_peers[i].fd); // 后端现成的发送昵称函数
+    }
 }
 
 int backend_connect_to_peer(const char* ip, int port)
