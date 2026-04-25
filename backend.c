@@ -138,6 +138,10 @@ int backend_connect_to_peer(const char* ip, int port)
 /* poll() — call every frame from the UI thread                        */
 /* ------------------------------------------------------------------ */
 
+const char* backend_get_nickname(void) {
+    return g_nickname;
+}
+
 void backend_poll(void)
 {
     if (g_listener_fd < 0 && g_peer_count == 0) return;

@@ -23,6 +23,7 @@ int  backend_connect_to_peer(const char* ip, int port); /* returns peer fd, or -
 void backend_shutdown(void);
 
 void backend_set_nickname(const char* nickname);
+const char* backend_get_nickname(void);
 int  backend_get_port(void);
 
 /* Called every frame from the UI to drive networking */

@@ -267,6 +267,10 @@ static const char* peer_name_for_fd(int fd) {
 }
 
 static void parse_and_push_incoming(peer_chat_t* c, const char* raw_msg) {
+    if (c->fd == -1 && raw_msg[0] == '[') {
+    chat_push_to(c, raw_msg, false);
+    return;
+    }
     char sender_name[64] = {0};
     const char* actual_msg = raw_msg;
     bool is_me = false;
@@ -305,15 +309,20 @@ void ui_on_msg(int fd, const char* msg) {
     parse_and_push_incoming(c, msg);
 }
 
+
 void ui_on_peer_connected(int fd) {
-    chat_push_system(TextFormat("*** Peer %d joined the network", fd));
+    chat_push_system(TextFormat("*** Peer (FD:%d) joined the network successfully", fd));
     peer_chat_t* c = chat_get_or_create(fd); 
     chat_push_to(c, "*** Tip: Type :smile:, :sad:, :heart:, :lol:, :angry: for emojis!", false);
 }
 
 void ui_on_peer_disconnected(int fd) {
-    chat_push_system(TextFormat("*** Peer %d disconnected", fd));
     peer_chat_t* c = chat_for_fd(fd);
+    
+    // 如果已经知道对方的名字，就显示名字，否则显示 FD 编号
+    const char* name = (c && strcmp(c->addr, "UNKNOWN") != 0) ? c->addr : TextFormat("FD:%d", fd);
+    chat_push_system(TextFormat("*** Peer [%s] disconnected", name));
+    
     if (c) chat_push_to(c, "*** Disconnected", false);
 }
 
@@ -395,6 +404,13 @@ void run_ui(void) {
     const int CHAT_W = W - CHAT_X - 10;
     const int CHAT_H = 480;
 
+    // 从后端获取命令行传入的昵称并覆盖默认的 "MyName"
+    const char* cmd_nick = backend_get_nickname();
+    if (cmd_nick && cmd_nick[0] != '\0') {
+        strncpy(g_me.nickname, cmd_nick, 31);
+        strncpy(nickname_buf, cmd_nick, 31);
+    }
+    // 通知后端最新状态
     backend_set_nickname(g_me.nickname);
 
     while (!WindowShouldClose()) {
@@ -508,10 +524,25 @@ void run_ui(void) {
         GuiLabel((Rectangle){15, conn_y + 5, 150, 20}, "CONNECT TO PEER");
         if (GuiTextBox((Rectangle){15, conn_y + 30, 215, 24}, ip_buf, 64, ip_edit)) ip_edit = !ip_edit;
         if (GuiTextBox((Rectangle){15, conn_y + 60, 80, 24}, port_buf, 12, port_edit)) port_edit = !port_edit;
-        if (GuiButton((Rectangle){105, conn_y + 60, 125, 24}, "Connect")) {
-            backend_connect_to_peer(ip_buf, atoi(port_buf));
-        }
 
+	if (GuiButton((Rectangle){105, conn_y + 60, 125, 24}, "Connect")) {
+            int port = atoi(port_buf);
+            if (port > 0 && ip_buf[0] != '\0') {
+                // 修改这里：严格拦截自己连自己
+                if (port == g_me.port && (strcmp(ip_buf, "127.0.0.1") == 0 || strcmp(ip_buf, "localhost") == 0)) {
+                    chat_push_system("*** Error: Cannot connect to yourself.");
+                } else {
+                    chat_push_system(TextFormat("*** Attempting to connect to %s:%d...", ip_buf, port));
+                    int fd = backend_connect_to_peer(ip_buf, port);
+                    if (fd < 0) {
+                        chat_push_system("*** Connection failed: Port may be closed or unreachable.");
+                    }
+                }
+            } else {
+                chat_push_system("*** Connection failed: Invalid IP or Port.");
+            }
+        }
+        
         /* ================= 右侧聊天区域 ================= */
         // 渲染动态背景
         DrawCoolBackground(CHAT_X, 10, CHAT_W, CHAT_H);
@@ -528,13 +559,24 @@ void run_ui(void) {
 
         for (int i = start_idx; i < active_chat->count && curr_y < CHAT_H - 20; i++) {
             chat_msg_t* m = &active_chat->messages[i];
-            bool isSys = (active_chat->fd == -1) || (strstr(m->text, "***") == m->text);
+            
+            // 只有以 "***" 开头的才是真正的系统提示
+            bool isSys = (strstr(m->text, "***") == m->text);
 
-            if (isSys) {
+            if (active_chat->fd == -1) {
+                // 情况A：在 System Log 界面，全部靠左按纯文本显示（像终端一样）
+                Color textColor = isSys ? GetColor(0xaaaaaaff) : LIGHTGRAY;
+                DrawText(TextFormat("[%s] %s", m->timestamp, m->text), CHAT_X + 15, curr_y, 14, textColor);
+                curr_y += 25;
+            } 
+            else if (isSys) {
+                // 情况B：在具体的聊天窗口里，遇到 *** 提示，居中显示
                 int txtW = MeasureText(m->text, 12);
                 DrawText(m->text, CHAT_X + CHAT_W/2 - txtW/2, curr_y, 12, GetColor(0xaaaaaaff));
                 curr_y += 25;
-            } else {
+            } 
+            else {
+                // 情况C：正常的聊天气泡
                 int boundsX = m->is_me ? (CHAT_X + CHAT_W - 15) : (CHAT_X + 15);
                 DrawChatBubble(m, active_chat->addr, boundsX, curr_y, CHAT_W - 120);
                 curr_y += 65; 
